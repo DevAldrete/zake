@@ -240,6 +240,3 @@ updated_at: 2026-06-05T12:00:00Z
 
 Zake manages the metadata and file lifecycle. Body writing and reading are left to your editor and normal file tools.
 
-## Documentation
-
-See [docs/IMPLEMENTED.md](docs/IMPLEMENTED.md) for the implementation ledger, architecture notes, current feature coverage, tests, and known limits.
