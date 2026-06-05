@@ -5,7 +5,7 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow};
 
 use crate::git::{self, GitStatus};
-use crate::index::NoteIndex;
+use crate::index::{LinkSource, NoteIndex};
 use crate::note::{self, Note};
 use crate::notebook::Notebook;
 use crate::search::{self, SearchHit};
@@ -22,6 +22,14 @@ pub enum FocusPane {
 pub enum Mode {
     Normal,
     Command(String),
+    Find {
+        query: String,
+        previous_selection: usize,
+        selected_match: usize,
+    },
+    ConfirmDelete {
+        note: Note,
+    },
 }
 
 #[derive(Debug)]
@@ -102,14 +110,15 @@ impl AppState {
     }
 
     pub fn run_command(&mut self, input: &str) -> Result<()> {
-        let mut words = input.split_whitespace();
-        let Some(command) = words.next() else {
+        let mut args = parse_command_args(input)?;
+        if args.is_empty() {
             return Ok(());
-        };
+        }
+        let command = args.remove(0);
 
-        match command {
+        match command.as_str() {
             "new" => {
-                let title = words.collect::<Vec<_>>().join(" ");
+                let title = args.join(" ");
                 if title.is_empty() {
                     return Err(anyhow!("usage: new <title>"));
                 }
@@ -118,7 +127,9 @@ impl AppState {
                 self.refresh();
             }
             "rename" => {
-                let title = words.collect::<Vec<_>>().join(" ");
+                let update_links = remove_flag(&mut args, "--update-links");
+                let dry_run = remove_flag(&mut args, "--dry-run");
+                let title = args.join(" ");
                 if title.is_empty() {
                     return Err(anyhow!("usage: rename <title>"));
                 }
@@ -126,12 +137,35 @@ impl AppState {
                     .selected_note()
                     .ok_or_else(|| anyhow!("no note selected"))?
                     .clone();
-                let path = note::rename_note(&selected, &title, &self.notebook)?;
-                self.message = format!("renamed to {}", path.display());
-                self.refresh();
+                if update_links {
+                    let repair = note::rename_note_with_link_repair(
+                        &selected,
+                        &title,
+                        &self.notebook,
+                        dry_run,
+                    )?;
+                    if dry_run {
+                        self.message = format!(
+                            "would rename to {} and update {} files",
+                            repair.renamed_path.display(),
+                            repair.updated_link_files.len()
+                        );
+                    } else {
+                        self.message = format!(
+                            "renamed to {} and updated {} files",
+                            repair.renamed_path.display(),
+                            repair.updated_link_files.len()
+                        );
+                        self.refresh();
+                    }
+                } else {
+                    let path = note::rename_note(&selected, &title, &self.notebook)?;
+                    self.message = format!("renamed to {}", path.display());
+                    self.refresh();
+                }
             }
             "move" => {
-                let folder = PathBuf::from(words.collect::<Vec<_>>().join(" "));
+                let folder = PathBuf::from(args.join(" "));
                 if folder.as_os_str().is_empty() {
                     return Err(anyhow!("usage: move <folder>"));
                 }
@@ -143,7 +177,7 @@ impl AppState {
                 self.message = format!("moved to {}", path.display());
                 self.refresh();
             }
-            "delete" => {
+            "delete!" => {
                 let selected = self
                     .selected_note()
                     .ok_or_else(|| anyhow!("no note selected"))?
@@ -152,8 +186,16 @@ impl AppState {
                 self.message = format!("deleted {}", selected.path.display());
                 self.refresh();
             }
+            "delete" => {
+                let selected = self
+                    .selected_note()
+                    .ok_or_else(|| anyhow!("no note selected"))?
+                    .clone();
+                self.mode = Mode::ConfirmDelete { note: selected };
+                self.message = "confirm delete with y, cancel with n or Esc".to_string();
+            }
             "tag" => {
-                let tags = words.map(str::to_string).collect::<Vec<_>>();
+                let tags = args;
                 let selected = self
                     .selected_note()
                     .ok_or_else(|| anyhow!("no note selected"))?
@@ -163,7 +205,7 @@ impl AppState {
                 self.refresh();
             }
             "type" => {
-                let kind = words.collect::<Vec<_>>().join(" ");
+                let kind = args.join(" ");
                 if kind.is_empty() {
                     return Err(anyhow!("usage: type <kind>"));
                 }
@@ -176,7 +218,7 @@ impl AppState {
                 self.refresh();
             }
             "link" => {
-                let links = words.map(str::to_string).collect::<Vec<_>>();
+                let links = args;
                 let selected = self
                     .selected_note()
                     .ok_or_else(|| anyhow!("no note selected"))?
@@ -194,7 +236,7 @@ impl AppState {
                 self.refresh();
             }
             "search" => {
-                let query = words.collect::<Vec<_>>().join(" ");
+                let query = args.join(" ");
                 self.search_hits = search::ripgrep(&self.notebook.root, &query)?;
                 self.selected_search = 0;
                 self.focus = FocusPane::Search;
@@ -220,7 +262,7 @@ impl AppState {
                 self.refresh();
             }
             "commit" => {
-                let message = words.collect::<Vec<_>>().join(" ");
+                let message = args.join(" ");
                 if message.is_empty() {
                     return Err(anyhow!("usage: commit <message>"));
                 }
@@ -228,18 +270,159 @@ impl AppState {
                 self.message = "committed changes".to_string();
                 self.refresh();
             }
+            "status" => {
+                self.refresh();
+                self.focus = FocusPane::Git;
+                self.message = format!("{} changes", self.git.files.len());
+            }
+            "history" => {
+                let limit = args
+                    .first()
+                    .map(|arg| arg.parse::<usize>())
+                    .transpose()
+                    .context("parse history limit")?
+                    .unwrap_or(10);
+                self.search_hits.clear();
+                self.history = git::history(&self.notebook.root, limit)?;
+                if self.history.is_empty() {
+                    self.history.push("no history".to_string());
+                }
+                self.focus = FocusPane::Search;
+                self.message = format!("{} history entries", self.history.len());
+            }
+            "diff" => {
+                let target = if args.is_empty() {
+                    self.selected_note().map(|note| note.path.clone())
+                } else {
+                    Some(PathBuf::from(args.join(" ")))
+                };
+                let diff = git::diff(&self.notebook.root, target.as_deref())?;
+                self.search_hits.clear();
+                self.history = if diff.is_empty() {
+                    vec!["no diff".to_string()]
+                } else {
+                    diff.lines().map(str::to_string).collect()
+                };
+                self.focus = FocusPane::Search;
+                self.message = "diff loaded".to_string();
+            }
+            "snapshot" => {
+                let message = args.join(" ");
+                if message.is_empty() {
+                    return Err(anyhow!("usage: snapshot <message>"));
+                }
+                git::snapshot(&self.notebook.root, &message)?;
+                self.message = "snapshotted notebook".to_string();
+                self.refresh();
+            }
+            "links" => {
+                let selected = self
+                    .selected_note()
+                    .ok_or_else(|| anyhow!("no note selected"))?
+                    .clone();
+                self.show_links(&selected);
+            }
+            "backlinks" => {
+                let selected = self
+                    .selected_note()
+                    .ok_or_else(|| anyhow!("no note selected"))?
+                    .clone();
+                self.show_backlinks(&selected);
+            }
+            "broken" => self.show_broken(),
+            "orphans" => self.show_orphans(),
             "refresh" => {
                 self.refresh();
                 self.message = "refreshed".to_string();
             }
             "help" | "?" => {
-                self.message = "Commands: new, rename, move, delete, tag, type, link, open, search, stage, unstage, stage-all, commit, refresh".to_string();
+                self.message = "Commands: new, rename, move, delete, delete!, tag, type, link, open, search, links, backlinks, broken, orphans, status, stage, unstage, stage-all, commit, history, diff, snapshot, refresh".to_string();
             }
             "quit" | "q" => self.should_quit = true,
             other => return Err(anyhow!("unknown command: {other}")),
         }
 
         Ok(())
+    }
+
+    pub fn find_matches(&self, query: &str) -> Vec<usize> {
+        if query.is_empty() {
+            return (0..self.index.notes.len()).collect();
+        }
+        self.index
+            .fuzzy_notes(query)
+            .into_iter()
+            .map(|matched| matched.index)
+            .collect()
+    }
+
+    pub fn show_links(&mut self, note: &Note) {
+        let statuses = self.index.link_statuses(note);
+        self.search_hits.clear();
+        self.history = statuses
+            .iter()
+            .map(|status| {
+                let source = match status.source {
+                    LinkSource::Metadata => "meta",
+                    LinkSource::Inline => "inline",
+                };
+                let state = if status.external {
+                    "external"
+                } else if status.resolved {
+                    "ok"
+                } else {
+                    "broken"
+                };
+                format!("{source}\t{state}\t{}", status.target)
+            })
+            .collect();
+        if self.history.is_empty() {
+            self.history.push("no links".to_string());
+        }
+        self.focus = FocusPane::Search;
+        self.message = format!("{} links", statuses.len());
+    }
+
+    pub fn show_backlinks(&mut self, note: &Note) {
+        let backlinks = self.index.backlinks_for(&note.meta.title);
+        self.search_hits.clear();
+        self.history = backlinks
+            .iter()
+            .map(|backlink| format!("{}\t{}", backlink.meta.title, backlink.path.display()))
+            .collect();
+        if self.history.is_empty() {
+            self.history.push("no backlinks".to_string());
+        }
+        self.focus = FocusPane::Search;
+        self.message = format!("{} backlinks", backlinks.len());
+    }
+
+    pub fn show_broken(&mut self) {
+        let entries = self.index.broken_entries();
+        self.search_hits.clear();
+        self.history = entries
+            .iter()
+            .map(|(note, target)| format!("{}\tmissing {}", note.meta.title, target))
+            .collect();
+        if self.history.is_empty() {
+            self.history.push("no broken links".to_string());
+        }
+        self.focus = FocusPane::Search;
+        self.message = format!("{} broken links", entries.len());
+    }
+
+    pub fn show_orphans(&mut self) {
+        let orphans = self.index.orphan_notes();
+        self.search_hits.clear();
+        self.history = orphans
+            .iter()
+            .map(|note| format!("{}\t{}", note.meta.title, note.path.display()))
+            .collect();
+        if self.history.is_empty() {
+            self.history.push("no orphans".to_string());
+        }
+        self.focus = FocusPane::Search;
+        self.message = format!("{} orphans", orphans.len());
     }
 }
 
@@ -260,4 +443,64 @@ fn open_external_editor(path: &PathBuf) -> Result<()> {
         return Err(anyhow!("editor exited unsuccessfully"));
     }
     Ok(())
+}
+
+fn remove_flag(args: &mut Vec<String>, flag: &str) -> bool {
+    let found = args.iter().any(|arg| arg == flag);
+    args.retain(|arg| arg != flag);
+    found
+}
+
+pub fn parse_command_args(input: &str) -> Result<Vec<String>> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut in_quotes = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            '\\' if in_quotes => match chars.next() {
+                Some('"') => current.push('"'),
+                Some('\\') => current.push('\\'),
+                Some(other) => {
+                    current.push('\\');
+                    current.push(other);
+                }
+                None => current.push('\\'),
+            },
+            ch if ch.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+            }
+            ch => current.push(ch),
+        }
+    }
+
+    if in_quotes {
+        return Err(anyhow!("unterminated quoted argument"));
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    Ok(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_command_args;
+
+    #[test]
+    fn parses_quoted_command_arguments() {
+        assert_eq!(
+            parse_command_args(r#"tag "machine learning" rust"#).unwrap(),
+            vec!["tag", "machine learning", "rust"]
+        );
+        assert_eq!(
+            parse_command_args(r#"link "Project \"Alpha\"""#).unwrap(),
+            vec!["link", r#"Project "Alpha""#]
+        );
+        assert!(parse_command_args(r#"tag "oops"#).is_err());
+    }
 }

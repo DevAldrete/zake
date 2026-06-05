@@ -15,6 +15,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{AppState, FocusPane, Mode};
+use crate::index::NoteIndex;
 
 pub fn run(mut app: AppState) -> Result<()> {
     enable_raw_mode()?;
@@ -58,10 +59,83 @@ fn handle_key(app: &mut AppState, key: KeyEvent) {
             KeyCode::Char(ch) => input.push(ch),
             _ => {}
         },
+        Mode::Find {
+            query,
+            previous_selection,
+            selected_match,
+        } => match key.code {
+            KeyCode::Esc => {
+                app.selected_note = *previous_selection;
+                app.mode = Mode::Normal;
+                app.message = "find cancelled".to_string();
+            }
+            KeyCode::Enter => {
+                let matches = find_matches(&app.index, query);
+                if let Some(note_idx) = matches.get(*selected_match) {
+                    app.selected_note = *note_idx;
+                }
+                app.mode = Mode::Normal;
+                app.focus = FocusPane::Notes;
+                app.message = "find selected".to_string();
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                *selected_match = 0;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let len = find_matches(&app.index, query).len();
+                *selected_match = move_find_selection(*selected_match, len, 1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                let len = find_matches(&app.index, query).len();
+                *selected_match = move_find_selection(*selected_match, len, -1);
+            }
+            KeyCode::Char('o') => {
+                let matches = find_matches(&app.index, query);
+                if let Some(note_idx) = matches.get(*selected_match) {
+                    app.selected_note = *note_idx;
+                    app.mode = Mode::Normal;
+                    if let Err(err) = app.run_command("open") {
+                        app.message = err.to_string();
+                    }
+                }
+            }
+            KeyCode::Char(ch) => {
+                query.push(ch);
+                *selected_match = 0;
+            }
+            _ => {}
+        },
+        Mode::ConfirmDelete { note } => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let note = note.clone();
+                app.mode = Mode::Normal;
+                if let Err(err) = crate::note::delete_note(&note) {
+                    app.message = err.to_string();
+                } else {
+                    app.message = format!("deleted {}", note.path.display());
+                    app.refresh();
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.mode = Mode::Normal;
+                app.message = "delete cancelled".to_string();
+            }
+            _ => {}
+        },
         Mode::Normal => match key.code {
             KeyCode::Char('q') => app.should_quit = true,
             KeyCode::Char(':') => app.mode = Mode::Command(String::new()),
-            KeyCode::Char('?') => app.message = "Commands: :new title | :rename title | :tag a b | :type kind | :link target | :search text | :stage | :unstage | :stage-all | :commit msg".to_string(),
+            KeyCode::Char('/') | KeyCode::Char('f') => {
+                app.mode = Mode::Find {
+                    query: String::new(),
+                    previous_selection: app.selected_note,
+                    selected_match: app.selected_note,
+                };
+                app.focus = FocusPane::Notes;
+                app.message = "type to fuzzy-find notes".to_string();
+            }
+            KeyCode::Char('?') => app.message = "Commands: / find | :new title | :rename title [--update-links] | :delete | :delete! | :links | :backlinks | :broken | :orphans | :tag a b | :type kind | :link target | :search text | :status | :stage | :unstage | :stage-all | :commit msg | :history | :diff | :snapshot msg".to_string(),
             KeyCode::Char('j') | KeyCode::Down => app.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => app.move_selection(-1),
             KeyCode::Tab => app.next_focus(),
@@ -107,18 +181,35 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &AppState) {
 }
 
 fn draw_notes(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
-    let items = app
-        .index
-        .notes
+    let find_state = match &app.mode {
+        Mode::Find {
+            query,
+            selected_match,
+            ..
+        } => Some((query.as_str(), *selected_match)),
+        _ => None,
+    };
+    let note_indices = find_state.map_or_else(
+        || (0..app.index.notes.len()).collect::<Vec<_>>(),
+        |(query, _)| app.find_matches(query),
+    );
+    let items = note_indices
         .iter()
         .enumerate()
-        .map(|(idx, note)| {
-            let marker = if idx == app.selected_note { ">" } else { " " };
-            ListItem::new(Line::from(vec![
+        .filter_map(|(row_idx, note_idx)| {
+            let note = app.index.notes.get(*note_idx)?;
+            let marker = if find_state.is_some_and(|(_, selected_match)| selected_match == row_idx)
+                || (find_state.is_none() && *note_idx == app.selected_note)
+            {
+                ">"
+            } else {
+                " "
+            };
+            Some(ListItem::new(Line::from(vec![
                 Span::styled(marker, Style::default().fg(Color::Cyan)),
                 Span::raw(" "),
                 Span::raw(&note.meta.title),
-            ]))
+            ])))
         })
         .collect::<Vec<_>>();
     frame.render_widget(
@@ -241,6 +332,12 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
             app.git.files.len()
         ),
         Mode::Command(input) => format!(":{input}"),
+        Mode::Find { query, .. } => format!("/{query}"),
+        Mode::ConfirmDelete { note } => format!(
+            "Delete \"{}\" at {}? y/N",
+            note.meta.title,
+            note.path.display()
+        ),
     };
     frame.render_widget(
         Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Command")),
@@ -266,4 +363,22 @@ fn label() -> Style {
     Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD)
+}
+
+fn move_find_selection(current: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    current.saturating_add_signed(delta).min(len - 1)
+}
+
+fn find_matches(index: &NoteIndex, query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..index.notes.len()).collect();
+    }
+    index
+        .fuzzy_notes(query)
+        .into_iter()
+        .map(|matched| matched.index)
+        .collect()
 }

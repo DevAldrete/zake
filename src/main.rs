@@ -1,11 +1,13 @@
 use anyhow::Result;
+use chrono::{Datelike, Local};
 use clap::Parser;
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use zake::app::AppState;
 use zake::cli::{Cli, Command};
+use zake::git;
 use zake::index::NoteIndex;
 use zake::note::{self as notes, Note};
 use zake::notebook::Notebook;
@@ -68,12 +70,37 @@ fn main() -> Result<()> {
             let selected = resolve_note(&notebook, &index, &note)?;
             print_note(&index, &selected);
         }
-        Some(Command::Rename { note, title, path }) => {
+        Some(Command::Rename {
+            note,
+            title,
+            update_links,
+            dry_run,
+            path,
+        }) => {
             let notebook = Notebook::discover(path)?;
             let index = NoteIndex::build(&notebook);
             let selected = resolve_note(&notebook, &index, &note)?;
-            let path = notes::rename_note(&selected, &title, &notebook)?;
-            println!("{}", path.display());
+            if update_links {
+                let repair =
+                    notes::rename_note_with_link_repair(&selected, &title, &notebook, dry_run)?;
+                if dry_run {
+                    println!("Would rename to {}", repair.renamed_path.display());
+                    for path in repair.updated_link_files {
+                        println!("Would update {}", path.display());
+                    }
+                } else {
+                    println!("{}", repair.renamed_path.display());
+                    for path in repair.updated_link_files {
+                        println!("Updated links in {}", path.display());
+                    }
+                }
+            } else {
+                if dry_run {
+                    anyhow::bail!("--dry-run requires --update-links");
+                }
+                let path = notes::rename_note(&selected, &title, &notebook)?;
+                println!("{}", path.display());
+            }
         }
         Some(Command::Move { note, folder, path }) => {
             let notebook = Notebook::discover(path)?;
@@ -82,12 +109,60 @@ fn main() -> Result<()> {
             let path = notes::move_note(&selected, &notebook, &folder)?;
             println!("{}", path.display());
         }
-        Some(Command::Delete { note, path }) => {
+        Some(Command::Delete { note, yes, path }) => {
             let notebook = Notebook::discover(path)?;
             let index = NoteIndex::build(&notebook);
             let selected = resolve_note(&notebook, &index, &note)?;
+            if !yes && !confirm_delete(&selected)? {
+                anyhow::bail!("delete cancelled");
+            }
             notes::delete_note(&selected)?;
             println!("Deleted {}", selected.path.display());
+        }
+        Some(Command::Links { note, path }) => {
+            let notebook = Notebook::discover(path)?;
+            let index = NoteIndex::build(&notebook);
+            let selected = resolve_note(&notebook, &index, &note)?;
+            for status in index.link_statuses(&selected) {
+                let source = match status.source {
+                    zake::index::LinkSource::Metadata => "metadata",
+                    zake::index::LinkSource::Inline => "inline",
+                };
+                let state = if status.external {
+                    "external"
+                } else if status.resolved {
+                    "ok"
+                } else {
+                    "broken"
+                };
+                println!("{source}\t{state}\t{}", status.target);
+            }
+        }
+        Some(Command::Backlinks { note, path }) => {
+            let notebook = Notebook::discover(path)?;
+            let index = NoteIndex::build(&notebook);
+            let selected = resolve_note(&notebook, &index, &note)?;
+            for backlink in index.backlinks_for(&selected.meta.title) {
+                println!("{}\t{}", backlink.meta.title, backlink.path.display());
+            }
+        }
+        Some(Command::Broken { path }) => {
+            let notebook = Notebook::discover(path)?;
+            let index = NoteIndex::build(&notebook);
+            let entries = index.broken_entries();
+            for (note, target) in &entries {
+                println!("{}\t{}\t{}", note.path.display(), note.meta.title, target);
+            }
+            if !entries.is_empty() {
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Orphans { path }) => {
+            let notebook = Notebook::discover(path)?;
+            let index = NoteIndex::build(&notebook);
+            for note in index.orphan_notes() {
+                println!("{}\t{}", note.path.display(), note.meta.title);
+            }
         }
         Some(Command::Set {
             note,
@@ -132,6 +207,62 @@ fn main() -> Result<()> {
                 println!("{}:{}:{}", hit.path.display(), hit.line, hit.text);
             }
         }
+        Some(Command::Status { path }) => {
+            let notebook = Notebook::discover(path)?;
+            let status = git::status(&notebook.root)?;
+            print_git_status(&status);
+        }
+        Some(Command::Stage { target, path }) => {
+            let notebook = Notebook::discover(path)?;
+            git::stage(&notebook.root, &target)?;
+            println!("Staged {}", target.display());
+        }
+        Some(Command::Unstage { target, path }) => {
+            let notebook = Notebook::discover(path)?;
+            git::unstage(&notebook.root, &target)?;
+            println!("Unstaged {}", target.display());
+        }
+        Some(Command::StageAll { path }) => {
+            let notebook = Notebook::discover(path)?;
+            git::stage_all(&notebook.root)?;
+            println!("Staged all changes");
+        }
+        Some(Command::Commit { message, path }) => {
+            let notebook = Notebook::discover(path)?;
+            git::commit(&notebook.root, &message)?;
+            println!("Committed changes");
+        }
+        Some(Command::History { limit, path }) => {
+            let notebook = Notebook::discover(path)?;
+            for line in git::history(&notebook.root, limit)? {
+                println!("{line}");
+            }
+        }
+        Some(Command::Diff { target, path }) => {
+            let notebook = Notebook::discover(path)?;
+            print!("{}", git::diff(&notebook.root, target.as_deref())?);
+        }
+        Some(Command::Snapshot { message, path }) => {
+            let notebook = Notebook::discover(path)?;
+            git::snapshot(&notebook.root, &message)?;
+            println!("Snapshotted notebook");
+        }
+        Some(Command::Today { path }) => {
+            let notebook = Notebook::discover(path)?;
+            let today = Local::now().date_naive();
+            let title = today.format("%Y-%m-%d").to_string();
+            let relative = PathBuf::from("daily").join(format!("{title}.md"));
+            let note = notes::create_or_open_note_at(&notebook, &relative, &title, "daily")?;
+            println!("{}", note.path.display());
+        }
+        Some(Command::Week { path }) => {
+            let notebook = Notebook::discover(path)?;
+            let week = Local::now().date_naive().iso_week();
+            let title = format!("{}-W{:02}", week.year(), week.week());
+            let relative = PathBuf::from("weekly").join(format!("{title}.md"));
+            let note = notes::create_or_open_note_at(&notebook, &relative, &title, "weekly")?;
+            println!("{}", note.path.display());
+        }
         None => {
             let notebook = match Notebook::discover(".") {
                 Ok(notebook) => notebook,
@@ -155,6 +286,35 @@ fn prompt_init_current_dir(reason: String) -> Result<Notebook> {
         Notebook::init(".")
     } else {
         anyhow::bail!("no notebook selected")
+    }
+}
+
+fn confirm_delete(note: &Note) -> Result<bool> {
+    if !io::stdin().is_terminal() {
+        anyhow::bail!("refusing to delete without confirmation; pass --yes to delete");
+    }
+    print!(
+        "Delete \"{}\" at {}? [y/N] ",
+        note.meta.title,
+        note.path.display()
+    );
+    io::stdout().flush()?;
+
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(answer.trim().eq_ignore_ascii_case("y") || answer.trim().eq_ignore_ascii_case("yes"))
+}
+
+fn print_git_status(status: &git::GitStatus) {
+    if status.files.is_empty() {
+        println!("clean");
+        return;
+    }
+
+    for file in &status.files {
+        let staged = file.staged.unwrap_or(' ');
+        let unstaged = file.unstaged.unwrap_or(' ');
+        println!("{staged}{unstaged}\t{}", file.path.display());
     }
 }
 
@@ -229,11 +389,8 @@ fn print_note(index: &NoteIndex, note: &Note) {
         println!("Inline links: {}", note.inline_links.join(", "));
     }
     let backlinks = index
-        .backlinks
-        .get(&note.meta.title.to_lowercase())
+        .backlinks_for(&note.meta.title)
         .into_iter()
-        .flatten()
-        .filter_map(|idx| index.notes.get(*idx))
         .map(|note| note.meta.title.as_str())
         .collect::<Vec<_>>();
     println!("Backlinks: {}", backlinks.join(", "));

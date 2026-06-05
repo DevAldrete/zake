@@ -108,6 +108,60 @@ impl NoteIndex {
             .collect()
     }
 
+    pub fn backlinks_for(&self, title: &str) -> Vec<&Note> {
+        self.backlinks
+            .get(&title.to_lowercase())
+            .into_iter()
+            .flatten()
+            .filter_map(|idx| self.notes.get(*idx))
+            .collect()
+    }
+
+    pub fn link_statuses(&self, note: &Note) -> Vec<LinkStatus> {
+        note.meta
+            .links
+            .iter()
+            .map(|target| LinkStatus::new(LinkSource::Metadata, target, self))
+            .chain(
+                note.inline_links
+                    .iter()
+                    .map(|target| LinkStatus::new(LinkSource::Inline, target, self)),
+            )
+            .collect()
+    }
+
+    pub fn broken_entries(&self) -> Vec<(&Note, &String)> {
+        self.notes
+            .iter()
+            .flat_map(|note| {
+                self.broken_links
+                    .get(&note.path)
+                    .into_iter()
+                    .flatten()
+                    .map(move |target| (note, target))
+            })
+            .collect()
+    }
+
+    pub fn orphan_notes(&self) -> Vec<&Note> {
+        self.notes
+            .iter()
+            .filter(|note| {
+                let outgoing_internal = note
+                    .meta
+                    .links
+                    .iter()
+                    .chain(note.inline_links.iter())
+                    .any(|target| !is_external(target) && self.resolves(target));
+                !outgoing_internal && self.backlinks_for(&note.meta.title).is_empty()
+            })
+            .collect()
+    }
+
+    pub fn resolves(&self, target: &str) -> bool {
+        self.by_title.contains_key(&target.to_lowercase())
+    }
+
     fn rebuild_links(&mut self) {
         let titles: BTreeSet<_> = self.by_title.keys().cloned().collect();
 
@@ -126,6 +180,32 @@ impl NoteIndex {
             if !missing.is_empty() {
                 self.broken_links.insert(note.path.clone(), missing);
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkSource {
+    Metadata,
+    Inline,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkStatus {
+    pub source: LinkSource,
+    pub target: String,
+    pub resolved: bool,
+    pub external: bool,
+}
+
+impl LinkStatus {
+    fn new(source: LinkSource, target: &str, index: &NoteIndex) -> Self {
+        let external = is_external(target);
+        Self {
+            source,
+            target: target.to_string(),
+            resolved: external || index.resolves(target),
+            external,
         }
     }
 }

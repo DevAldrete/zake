@@ -98,6 +98,23 @@ pub fn create_note_with_metadata(
     })
 }
 
+pub fn create_or_open_note_at(
+    notebook: &Notebook,
+    relative_path: &Path,
+    title: &str,
+    kind: &str,
+) -> Result<Note> {
+    let path = notebook.notes_root().join(relative_path);
+    if path.exists() {
+        return parse_note(path);
+    }
+
+    let mut meta = NoteMeta::new(title);
+    meta.kind = kind.to_string();
+    write_new_note(&path, &meta)?;
+    parse_note(path)
+}
+
 pub fn rename_note(note: &Note, new_title: &str, notebook: &Notebook) -> Result<PathBuf> {
     let new_slug = slugify(new_title);
     let new_path = notebook.notes_root().join(format!("{new_slug}.md"));
@@ -114,6 +131,39 @@ pub fn rename_note(note: &Note, new_title: &str, notebook: &Notebook) -> Result<
             .with_context(|| format!("rename {} to {}", note.path.display(), new_path.display()))?;
     }
     Ok(new_path)
+}
+
+pub fn rename_note_with_link_repair(
+    note: &Note,
+    new_title: &str,
+    notebook: &Notebook,
+    dry_run: bool,
+) -> Result<RenameRepair> {
+    let old_title = note.meta.title.clone();
+    let new_slug = slugify(new_title);
+    let new_path = notebook.notes_root().join(format!("{new_slug}.md"));
+    if new_path != note.path && new_path.exists() {
+        bail!("target note already exists: {}", new_path.display());
+    }
+
+    let mut changed_paths = repair_links(notebook, &old_title, new_title, dry_run)?;
+    if !dry_run {
+        let renamed_path = rename_note(note, new_title, notebook)?;
+        for path in &mut changed_paths {
+            if path == &note.path {
+                *path = renamed_path.clone();
+            }
+        }
+        Ok(RenameRepair {
+            renamed_path,
+            updated_link_files: changed_paths,
+        })
+    } else {
+        Ok(RenameRepair {
+            renamed_path: new_path,
+            updated_link_files: changed_paths,
+        })
+    }
 }
 
 pub fn move_note(note: &Note, notebook: &Notebook, folder: &Path) -> Result<PathBuf> {
@@ -143,6 +193,12 @@ pub fn update_metadata(path: &Path, edit: impl FnOnce(&mut NoteMeta)) -> Result<
     update_frontmatter(path, &meta)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameRepair {
+    pub renamed_path: PathBuf,
+    pub updated_link_files: Vec<PathBuf>,
+}
+
 pub fn parse_note(path: impl AsRef<Path>) -> Result<Note> {
     let path = path.as_ref();
     let (meta, body) = read_note_parts(path)?;
@@ -165,6 +221,10 @@ fn write_new_note(path: &Path, meta: &NoteMeta) -> Result<()> {
 
 fn update_frontmatter(path: &Path, meta: &NoteMeta) -> Result<()> {
     let (_, body) = read_note_parts(path)?;
+    write_note_parts(path, meta, &body)
+}
+
+fn write_note_parts(path: &Path, meta: &NoteMeta, body: &str) -> Result<()> {
     let frontmatter = serde_yaml::to_string(meta)?;
     fs::write(path, format!("---\n{frontmatter}---\n{body}"))
         .with_context(|| format!("write {}", path.display()))
@@ -224,6 +284,78 @@ fn extract_markdown_links(line: &str, links: &mut BTreeSet<String>) {
     }
 }
 
+fn repair_links(
+    notebook: &Notebook,
+    old_title: &str,
+    new_title: &str,
+    dry_run: bool,
+) -> Result<Vec<PathBuf>> {
+    let mut changed_paths = Vec::new();
+    let index = crate::index::NoteIndex::build(notebook);
+
+    for note in index.notes {
+        let (mut meta, body) = read_note_parts(&note.path)?;
+        let mut changed = false;
+
+        for link in &mut meta.links {
+            if link == old_title {
+                *link = new_title.to_string();
+                changed = true;
+            }
+        }
+
+        let repaired_body = replace_wiki_links(&body, old_title, new_title);
+        if repaired_body != body {
+            changed = true;
+        }
+
+        if changed {
+            changed_paths.push(note.path.clone());
+            if !dry_run {
+                meta.updated_at = Utc::now();
+                write_note_parts(&note.path, &meta, &repaired_body)?;
+            }
+        }
+    }
+
+    Ok(changed_paths)
+}
+
+fn replace_wiki_links(body: &str, old_title: &str, new_title: &str) -> String {
+    let mut output = String::with_capacity(body.len());
+    let mut rest = body;
+
+    while let Some(start) = rest.find("[[") {
+        output.push_str(&rest[..start]);
+        output.push_str("[[");
+        rest = &rest[start + 2..];
+
+        let Some(end) = rest.find("]]") else {
+            output.push_str(rest);
+            return output;
+        };
+
+        let inner = &rest[..end];
+        let (target, label) = inner
+            .split_once('|')
+            .map_or((inner, None), |(target, label)| (target, Some(label)));
+        if target.trim() == old_title {
+            output.push_str(new_title);
+            if let Some(label) = label {
+                output.push('|');
+                output.push_str(label);
+            }
+        } else {
+            output.push_str(inner);
+        }
+        output.push_str("]]");
+        rest = &rest[end + 2..];
+    }
+
+    output.push_str(rest);
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +374,44 @@ mod tests {
         let links =
             extract_inline_links("See [[Daily Note|today]] and [Rust](https://rust-lang.org).");
         assert_eq!(links, vec!["Daily Note", "https://rust-lang.org"]);
+    }
+
+    #[test]
+    fn repairs_exact_wiki_links_and_metadata_links() {
+        let dir = tempdir().unwrap();
+        let notebook = Notebook::init(dir.path()).unwrap();
+        let old = create_note(&notebook, "Old Title").unwrap();
+        let referer = create_note_with_metadata(
+            &notebook,
+            "Referer",
+            None,
+            Vec::new(),
+            vec!["Old Title".to_string()],
+        )
+        .unwrap();
+        fs::write(
+            &referer.path,
+            r#"---
+title: Referer
+type: note
+tags: []
+links:
+- Old Title
+created_at: 2026-01-01T00:00:00Z
+updated_at: 2026-01-01T00:00:00Z
+---
+
+See [[Old Title]] and [[Old Title|the old one]].
+"#,
+        )
+        .unwrap();
+
+        rename_note_with_link_repair(&old, "New Title", &notebook, false).unwrap();
+        let repaired = parse_note(&referer.path).unwrap();
+        assert_eq!(repaired.meta.links, vec!["New Title"]);
+        let raw = fs::read_to_string(&referer.path).unwrap();
+        assert!(raw.contains("[[New Title]]"));
+        assert!(raw.contains("[[New Title|the old one]]"));
     }
 
     #[test]

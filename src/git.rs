@@ -74,6 +74,40 @@ pub fn commit(root: &Path, message: &str) -> Result<()> {
     run_git(root, &["commit", "-m", message])
 }
 
+pub fn has_staged_changes(root: &Path) -> Result<bool> {
+    let status = Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(root)
+        .status()
+        .context("run git diff --cached --quiet")?;
+    match status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => bail!("git diff --cached --quiet failed"),
+    }
+}
+
+pub fn snapshot(root: &Path, message: &str) -> Result<()> {
+    stage_all(root)?;
+    if !has_staged_changes(root)? {
+        bail!("nothing to snapshot");
+    }
+    commit(root, message)
+}
+
+pub fn diff(root: &Path, path: Option<&Path>) -> Result<String> {
+    let mut command = Command::new("git");
+    command.args(["diff", "--"]);
+    if let Some(path) = path {
+        command.arg(path);
+    }
+    let output = command.current_dir(root).output().context("run git diff")?;
+    if !output.status.success() {
+        bail!("git diff failed");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 pub fn history(root: &Path, limit: usize) -> Result<Vec<String>> {
     let output = Command::new("git")
         .args(["log", "--oneline", "--decorate", "-n", &limit.to_string()])
@@ -178,6 +212,34 @@ mod tests {
         commit(dir.path(), "add note").unwrap();
         assert!(status(dir.path()).unwrap().files.is_empty());
         assert!(history(dir.path(), 1).unwrap()[0].contains("add note"));
+    }
+
+    #[test]
+    fn snapshots_all_changes_and_rejects_empty_snapshot() {
+        let dir = tempdir().unwrap();
+        git_cmd(dir.path(), &["init"]);
+        git_cmd(dir.path(), &["config", "user.email", "zake@example.test"]);
+        git_cmd(dir.path(), &["config", "user.name", "Zake Test"]);
+        fs::write(dir.path().join("note.md"), "hello").unwrap();
+
+        snapshot(dir.path(), "snapshot notes").unwrap();
+        assert!(status(dir.path()).unwrap().files.is_empty());
+        assert!(history(dir.path(), 1).unwrap()[0].contains("snapshot notes"));
+        assert!(snapshot(dir.path(), "empty").is_err());
+    }
+
+    #[test]
+    fn returns_diff_text() {
+        let dir = tempdir().unwrap();
+        git_cmd(dir.path(), &["init"]);
+        git_cmd(dir.path(), &["config", "user.email", "zake@example.test"]);
+        git_cmd(dir.path(), &["config", "user.name", "Zake Test"]);
+        fs::write(dir.path().join("note.md"), "hello\n").unwrap();
+        snapshot(dir.path(), "add note").unwrap();
+        fs::write(dir.path().join("note.md"), "hello\nworld\n").unwrap();
+
+        let diff = diff(dir.path(), Some(Path::new("note.md"))).unwrap();
+        assert!(diff.contains("+world"));
     }
 
     fn git_cmd(root: &Path, args: &[&str]) {

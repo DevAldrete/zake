@@ -52,6 +52,10 @@ pub enum Command {
     Rename {
         note: String,
         title: String,
+        #[arg(long)]
+        update_links: bool,
+        #[arg(long)]
+        dry_run: bool,
         #[arg(default_value = ".")]
         path: PathBuf,
     },
@@ -65,6 +69,30 @@ pub enum Command {
     /// Delete a note by title or path.
     Delete {
         note: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// List links from one note and whether they resolve.
+    Links {
+        note: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// List notes linking to one note.
+    Backlinks {
+        note: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// List unresolved internal links.
+    Broken {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// List notes with no internal links or backlinks.
+    Orphans {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
@@ -93,6 +121,63 @@ pub enum Command {
     /// Search the notebook with ripgrep.
     Search {
         query: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Show notebook Git status.
+    Status {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Stage a path in the notebook Git repo.
+    Stage {
+        target: PathBuf,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Unstage a path in the notebook Git repo.
+    Unstage {
+        target: PathBuf,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Stage all notebook changes.
+    StageAll {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Commit staged notebook changes.
+    Commit {
+        message: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Show recent notebook Git history.
+    History {
+        #[arg(short = 'n', long, default_value_t = 10)]
+        limit: usize,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Show Git diff for the notebook or one path.
+    Diff {
+        target: Option<PathBuf>,
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Stage all notebook changes and commit them.
+    Snapshot {
+        message: String,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Create or show today's daily note.
+    Today {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Create or show this week's weekly note.
+    Week {
         #[arg(default_value = ".")]
         path: PathBuf,
     },

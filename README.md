@@ -11,17 +11,35 @@ Zake has a working v1 foundation:
 - Notebook initialization with `.zake/config.toml`
 - Markdown note stubs with YAML frontmatter
 - In-memory note index for titles, tags, types, links, backlinks, and broken links
-- Ratatui-based TUI with notes, metadata, Git, search/history, and command panes
+- Ratatui-based TUI with notes, fuzzy search, metadata, Git, search/history, and command panes
 - Shell-backed Git status, stage, unstage, stage-all, commit, and log history
+- Explicit Git convenience commands while leaving the repository user-owned
 - Ripgrep-backed search results
 - External editor handoff through `$EDITOR`
-- CLI helpers for initialization, diagnostics, note creation, and search
+- CLI helpers for initialization, diagnostics, note creation, graph health, rituals, and search
 
 Zake intentionally does not render full note bodies as a reading view and does not provide an internal body editor.
 
 ## Install And Run
 
-Build from source:
+For final users, see [docs/INSTALL.md](docs/INSTALL.md).
+
+Quick source install:
+
+```sh
+cargo install --path .
+```
+
+After installation, run Zake directly:
+
+```sh
+zake --help
+zake init ~/notes
+cd ~/notes
+zake
+```
+
+For development, build from source:
 
 ```sh
 cargo build
@@ -36,7 +54,7 @@ cargo test
 Start the TUI from inside a notebook:
 
 ```sh
-cargo run
+zake
 ```
 
 If the current directory is not a Zake notebook, the TUI startup path will ask whether to initialize one there.
@@ -46,56 +64,91 @@ If the current directory is not a Zake notebook, the TUI startup path will ask w
 Initialize a notebook:
 
 ```sh
-cargo run -- init [path]
+zake init [path]
 ```
 
 Check notebook health:
 
 ```sh
-cargo run -- doctor [path]
+zake doctor [path]
 ```
 
 Create a note stub:
 
 ```sh
-cargo run -- new "My Note Title" --type idea --tag rust --tag cli --link "Another Note" [path]
+zake new "My Note Title" --type idea --tag rust --tag cli --link "Another Note" [path]
 ```
 
 List notes, optionally filtered by tag or type:
 
 ```sh
-cargo run -- list [path]
-cargo run -- list --tag rust [path]
-cargo run -- list --type idea [path]
+zake list [path]
+zake list --tag rust [path]
+zake list --type idea [path]
 ```
 
 Inspect a note by exact title or path:
 
 ```sh
-cargo run -- show "My Note Title" [path]
+zake show "My Note Title" [path]
 ```
 
 Update note metadata from the CLI:
 
 ```sh
-cargo run -- set "My Note Title" --type reference --tag rust --tag docs --link "Related Note" [path]
-cargo run -- set "My Note Title" --clear-tags --clear-links [path]
+zake set "My Note Title" --type reference --tag rust --tag docs --link "Related Note" [path]
+zake set "My Note Title" --clear-tags --clear-links [path]
 ```
 
 Manage note files from the CLI:
 
 ```sh
-cargo run -- rename "My Note Title" "Better Title" [path]
-cargo run -- move "Better Title" archive [path]
-cargo run -- delete "Better Title" [path]
-cargo run -- open "Better Title" [path]
+zake rename "My Note Title" "Better Title" [path]
+zake rename "My Note Title" "Better Title" --update-links [path]
+zake move "Better Title" archive [path]
+zake delete "Better Title" [path]
+zake delete "Better Title" --yes [path]
+zake open "Better Title" [path]
+```
+
+Inspect graph health:
+
+```sh
+zake links "My Note Title" [path]
+zake backlinks "My Note Title" [path]
+zake broken [path]
+zake orphans [path]
+```
+
+Create ritual notes:
+
+```sh
+zake today [path]
+zake week [path]
 ```
 
 Search note files with ripgrep:
 
 ```sh
-cargo run -- search "query" [path]
+zake search "query" [path]
 ```
+
+Manage notebook Git history:
+
+```sh
+zake status [path]
+zake stage note.md [path]
+zake unstage note.md [path]
+zake stage-all [path]
+zake commit "Update notes" [path]
+zake history [path]
+zake diff [note.md] --path [path]
+zake snapshot "End of day notes" [path]
+```
+
+Zake does not hide Git. These commands are convenience wrappers for common
+notebook maintenance, and you can still use normal `git` commands in the notebook
+repo whenever you want.
 
 ## TUI Basics
 
@@ -104,6 +157,7 @@ Navigation:
 - `j` / `Down`: move selection down
 - `k` / `Up`: move selection up
 - `Tab`: cycle panes
+- `/` / `f`: fuzzy-find notes
 - `:`: open command prompt
 - `?`: show command help
 - `r`: refresh index and Git state
@@ -114,17 +168,27 @@ Commands:
 
 - `:new <title>`
 - `:rename <title>`
+- `:rename <title> --update-links`
 - `:move <folder>`
 - `:delete`
+- `:delete!`
 - `:tag <tag>...`
 - `:type <kind>`
 - `:link <target>...`
 - `:open`
 - `:search <query>`
+- `:links`
+- `:backlinks`
+- `:broken`
+- `:orphans`
 - `:stage`
 - `:unstage`
 - `:stage-all`
 - `:commit <message>`
+- `:status`
+- `:history [limit]`
+- `:diff [path]`
+- `:snapshot <message>`
 - `:refresh`
 - `:quit`
 
