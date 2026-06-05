@@ -4,7 +4,7 @@ This document records what has been implemented so far in Zake and how the piece
 
 ## Summary
 
-Zake is currently a Rust CLI/TUI application for managing a Markdown notebook backed by Git. The implemented version covers the first usable foundation: notebook initialization, note metadata management, lazy indexing, terminal navigation, graph health checks, explicit Git convenience commands, ripgrep search, rituals, and diagnostics.
+Zake is currently a Rust CLI/TUI application for managing a Markdown notebook backed by Git. The implemented version covers the first usable foundation: notebook initialization, note metadata management, lazy indexing, interactive terminal navigation, switchable TUI layouts, graph health checks, explicit Git convenience commands, ripgrep search, rituals, and diagnostics.
 
 The implementation follows the planned constraint that Zake manages notes but does not become an internal note body reader or editor.
 
@@ -26,6 +26,9 @@ Note management:
 - `zake new` accepts `--type`, repeated `--tag`, and repeated `--link` flags for creating notes with metadata.
 - CLI commands support listing, showing, renaming, moving, deleting, opening, graph health, ritual notes, and updating note metadata by exact title or path.
 - TUI commands support creating, fuzzy finding, renaming, moving, deleting with confirmation, graph health, and updating note metadata.
+- TUI pane actions use `Enter`: edit the selected note in `$EDITOR`, toggle the selected Git path between staged and unstaged, or open a selected search hit in `$EDITOR`.
+- TUI layout controls include `w` to cycle arrangements, `m` to zoom/unzoom the focused pane, `Tab` and `Shift-Tab` to move between panes, and per-pane titles with action hints.
+- Fast TUI actions include prefilled link commands, Git history, selected-note diff, timestamped snapshots, stage, unstage, and stage-all.
 - Metadata commands update only frontmatter fields: tags, type, and links.
 - `:open` launches the selected note in `$EDITOR` and refreshes state after the editor exits.
 - `zake rename <note> <title> --update-links` repairs exact frontmatter links and wiki links.
@@ -51,6 +54,7 @@ Git:
 - Status uses `git status --porcelain=v1 -z`.
 - TUI commands support `:stage`, `:unstage`, `:stage-all`, and `:commit <message>`.
 - TUI commands also support `:status`, `:history [limit]`, `:diff [path]`, and `:snapshot <message>`.
+- TUI Git keybindings include `h` for history, `d` for selected-note diff, `z` for an immediate timestamped snapshot, `s`/`u` for stage/unstage, and `Ctrl-a` for stage-all.
 - Recent history uses `git log --oneline --decorate`.
 - `unstage` handles both normal repositories and unborn repositories before the first commit.
 
@@ -137,7 +141,7 @@ cargo test
 
 ## Current Limits
 
-- The TUI is a functional first shell, not a polished final UX.
+- The TUI is keyboard-forward and layout-switchable, but still intentionally avoids becoming an internal Markdown body reader/editor.
 - There is no persistent index or database.
 - Git commit prompts are single-line command entries only.
 - Search depends on `rg` being installed.

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
+use chrono::Local;
 
 use crate::git::{self, GitStatus};
 use crate::index::{LinkSource, NoteIndex};
@@ -16,6 +17,14 @@ pub enum FocusPane {
     Metadata,
     Git,
     Search,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    Columns,
+    Workbench,
+    GitWide,
+    Stack,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +52,8 @@ pub struct AppState {
     pub selected_git: usize,
     pub selected_search: usize,
     pub focus: FocusPane,
+    pub layout: LayoutMode,
+    pub zoomed: Option<FocusPane>,
     pub mode: Mode,
     pub message: String,
     pub should_quit: bool,
@@ -63,8 +74,10 @@ impl AppState {
             selected_git: 0,
             selected_search: 0,
             focus: FocusPane::Notes,
+            layout: LayoutMode::Workbench,
+            zoomed: None,
             mode: Mode::Normal,
-            message: "Press : for commands, ? for help, q to quit".to_string(),
+            message: "Enter edit | Tab pane | w layout | m zoom | ? help".to_string(),
             should_quit: false,
         }
     }
@@ -83,6 +96,9 @@ impl AppState {
         self.selected_git = self
             .selected_git
             .min(self.git.files.len().saturating_sub(1));
+        self.selected_search = self
+            .selected_search
+            .min(self.search_hits.len().saturating_sub(1));
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -94,8 +110,12 @@ impl AppState {
                 self.selected_git = move_index(self.selected_git, self.git.files.len(), delta);
             }
             FocusPane::Search => {
-                self.selected_search =
-                    move_index(self.selected_search, self.search_hits.len(), delta);
+                let len = if self.search_hits.is_empty() {
+                    self.history.len()
+                } else {
+                    self.search_hits.len()
+                };
+                self.selected_search = move_index(self.selected_search, len, delta);
             }
         }
     }
@@ -107,6 +127,112 @@ impl AppState {
             FocusPane::Git => FocusPane::Search,
             FocusPane::Search => FocusPane::Notes,
         };
+    }
+
+    pub fn previous_focus(&mut self) {
+        self.focus = match self.focus {
+            FocusPane::Notes => FocusPane::Search,
+            FocusPane::Metadata => FocusPane::Notes,
+            FocusPane::Git => FocusPane::Metadata,
+            FocusPane::Search => FocusPane::Git,
+        };
+    }
+
+    pub fn cycle_layout(&mut self) {
+        self.layout = match self.layout {
+            LayoutMode::Columns => LayoutMode::Workbench,
+            LayoutMode::Workbench => LayoutMode::GitWide,
+            LayoutMode::GitWide => LayoutMode::Stack,
+            LayoutMode::Stack => LayoutMode::Columns,
+        };
+        self.zoomed = None;
+        self.message = format!("layout: {}", self.layout.label());
+    }
+
+    pub fn toggle_zoom(&mut self) {
+        self.zoomed = match self.zoomed {
+            Some(pane) if pane == self.focus => None,
+            _ => Some(self.focus),
+        };
+        self.message = if self.zoomed.is_some() {
+            format!("zoomed {}", self.focus.label())
+        } else {
+            "zoom off".to_string()
+        };
+    }
+
+    pub fn edit_selected(&mut self) -> Result<()> {
+        let selected = self
+            .selected_note()
+            .ok_or_else(|| anyhow!("no note selected"))?
+            .clone();
+        open_external_editor(&selected.path).context("open external editor")?;
+        self.message = "returned from editor".to_string();
+        self.refresh();
+        Ok(())
+    }
+
+    pub fn open_selected_search_hit(&mut self) -> Result<()> {
+        let hit = self
+            .search_hits
+            .get(self.selected_search)
+            .ok_or_else(|| anyhow!("no search hit selected"))?
+            .clone();
+        self.select_note_by_path(&hit.path)
+            .ok_or_else(|| anyhow!("search hit is not an indexed note"))?;
+        self.edit_selected()
+    }
+
+    pub fn toggle_selected_git(&mut self) -> Result<()> {
+        let file = self
+            .git
+            .files
+            .get(self.selected_git)
+            .ok_or_else(|| anyhow!("no Git file selected"))?;
+        if file.staged.is_some() && file.unstaged.is_none() && !file.is_untracked() {
+            git::unstage(&self.notebook.root, &file.path)?;
+            self.message = format!("unstaged {}", file.path.display());
+        } else {
+            git::stage(&self.notebook.root, &file.path)?;
+            self.message = format!("staged {}", file.path.display());
+        }
+        self.refresh();
+        Ok(())
+    }
+
+    pub fn snapshot_now(&mut self) -> Result<()> {
+        let message = format!("Snapshot {}", Local::now().format("%Y-%m-%d %H:%M"));
+        git::snapshot(&self.notebook.root, &message)?;
+        self.message = format!("snapshotted: {message}");
+        self.refresh();
+        Ok(())
+    }
+
+    pub fn command_for_selected_link(&self) -> String {
+        let mut command = String::from("link ");
+        if let Some(note) = self.selected_note() {
+            command.push('"');
+            command.push_str(&note.meta.title.replace('"', "\\\""));
+            command.push('"');
+            command.push(' ');
+        }
+        command
+    }
+
+    pub fn select_note_by_path(&mut self, path: &PathBuf) -> Option<()> {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            self.notebook.root.join(path)
+        };
+        let idx = self
+            .index
+            .notes
+            .iter()
+            .position(|note| note.path == *path || note.path == absolute)?;
+        self.selected_note = idx;
+        self.focus = FocusPane::Notes;
+        Some(())
     }
 
     pub fn run_command(&mut self, input: &str) -> Result<()> {
@@ -228,12 +354,7 @@ impl AppState {
                 self.refresh();
             }
             "open" => {
-                let selected = self
-                    .selected_note()
-                    .ok_or_else(|| anyhow!("no note selected"))?;
-                open_external_editor(&selected.path).context("open external editor")?;
-                self.message = "returned from editor".to_string();
-                self.refresh();
+                self.edit_selected()?;
             }
             "search" => {
                 let query = args.join(" ");
@@ -287,6 +408,7 @@ impl AppState {
                 if self.history.is_empty() {
                     self.history.push("no history".to_string());
                 }
+                self.selected_search = 0;
                 self.focus = FocusPane::Search;
                 self.message = format!("{} history entries", self.history.len());
             }
@@ -303,6 +425,7 @@ impl AppState {
                 } else {
                     diff.lines().map(str::to_string).collect()
                 };
+                self.selected_search = 0;
                 self.focus = FocusPane::Search;
                 self.message = "diff loaded".to_string();
             }
@@ -379,6 +502,7 @@ impl AppState {
         if self.history.is_empty() {
             self.history.push("no links".to_string());
         }
+        self.selected_search = 0;
         self.focus = FocusPane::Search;
         self.message = format!("{} links", statuses.len());
     }
@@ -393,6 +517,7 @@ impl AppState {
         if self.history.is_empty() {
             self.history.push("no backlinks".to_string());
         }
+        self.selected_search = 0;
         self.focus = FocusPane::Search;
         self.message = format!("{} backlinks", backlinks.len());
     }
@@ -407,6 +532,7 @@ impl AppState {
         if self.history.is_empty() {
             self.history.push("no broken links".to_string());
         }
+        self.selected_search = 0;
         self.focus = FocusPane::Search;
         self.message = format!("{} broken links", entries.len());
     }
@@ -421,8 +547,31 @@ impl AppState {
         if self.history.is_empty() {
             self.history.push("no orphans".to_string());
         }
+        self.selected_search = 0;
         self.focus = FocusPane::Search;
         self.message = format!("{} orphans", orphans.len());
+    }
+}
+
+impl FocusPane {
+    pub fn label(self) -> &'static str {
+        match self {
+            FocusPane::Notes => "notes",
+            FocusPane::Metadata => "metadata",
+            FocusPane::Git => "git",
+            FocusPane::Search => "search",
+        }
+    }
+}
+
+impl LayoutMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            LayoutMode::Columns => "columns",
+            LayoutMode::Workbench => "workbench",
+            LayoutMode::GitWide => "git-wide",
+            LayoutMode::Stack => "stack",
+        }
     }
 }
 

@@ -152,17 +152,43 @@ repo whenever you want.
 
 ## TUI Basics
 
+The TUI is an interactive control surface made of movable panes. It keeps note
+body editing in your configured editor, but makes note navigation, metadata,
+links, search results, and Git history quick to operate from one terminal.
+
 Navigation:
 
 - `j` / `Down`: move selection down
 - `k` / `Up`: move selection up
 - `Tab`: cycle panes
+- `Shift-Tab`: cycle panes backward
+- `w`: cycle pane arrangements
+- `m`: zoom or unzoom the focused pane
+- `Enter`: act on the focused pane
 - `/` / `f`: fuzzy-find notes
 - `:`: open command prompt
 - `?`: show command help
 - `r`: refresh index and Git state
 - `n`: start `new` command
 - `q`: quit
+
+Focused pane actions:
+
+- Notes or metadata: `Enter` opens the selected note in `$EDITOR`.
+- Git: `Enter` toggles the selected path between staged and unstaged.
+- Search results: `Enter` opens the matching note in `$EDITOR`.
+- History, diff, links, backlinks, broken links, and orphan reports are shown in
+  the search/history pane and can be selected with normal navigation.
+
+Fast actions:
+
+- `l`: start a link command prefilled with the selected note title.
+- `h`: show recent Git history.
+- `d`: show the selected note's Git diff.
+- `z`: snapshot immediately with a timestamped commit message.
+- `s`: stage the selected Git path.
+- `u`: unstage the selected Git path.
+- `Ctrl-a`: stage all Git changes.
 
 Commands:
 

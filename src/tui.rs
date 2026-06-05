@@ -11,10 +11,10 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
-use crate::app::{AppState, FocusPane, Mode};
+use crate::app::{AppState, FocusPane, LayoutMode, Mode};
 use crate::index::NoteIndex;
 
 pub fn run(mut app: AppState) -> Result<()> {
@@ -35,21 +35,29 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut AppStat
         terminal.draw(|frame| draw(frame, app))?;
         if event::poll(Duration::from_millis(150))? {
             if let Event::Key(key) = event::read()? {
-                handle_key(app, key);
+                handle_key(terminal, app, key)?;
             }
         }
     }
     Ok(())
 }
 
-fn handle_key(app: &mut AppState, key: KeyEvent) {
+fn handle_key(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut AppState,
+    key: KeyEvent,
+) -> Result<()> {
     match &mut app.mode {
         Mode::Command(input) => match key.code {
             KeyCode::Esc => app.mode = Mode::Normal,
             KeyCode::Enter => {
                 let command = input.clone();
                 app.mode = Mode::Normal;
-                if let Err(err) = app.run_command(&command) {
+                if command.trim() == "open" {
+                    if let Err(err) = edit_with_terminal_restore(terminal, app) {
+                        app.message = err.to_string();
+                    }
+                } else if let Err(err) = app.run_command(&command) {
                     app.message = err.to_string();
                 }
             }
@@ -95,7 +103,7 @@ fn handle_key(app: &mut AppState, key: KeyEvent) {
                 if let Some(note_idx) = matches.get(*selected_match) {
                     app.selected_note = *note_idx;
                     app.mode = Mode::Normal;
-                    if let Err(err) = app.run_command("open") {
+                    if let Err(err) = edit_with_terminal_restore(terminal, app) {
                         app.message = err.to_string();
                     }
                 }
@@ -126,6 +134,7 @@ fn handle_key(app: &mut AppState, key: KeyEvent) {
         Mode::Normal => match key.code {
             KeyCode::Char('q') => app.should_quit = true,
             KeyCode::Char(':') => app.mode = Mode::Command(String::new()),
+            KeyCode::Enter => run_enter_action(terminal, app),
             KeyCode::Char('/') | KeyCode::Char('f') => {
                 app.mode = Mode::Find {
                     query: String::new(),
@@ -135,23 +144,95 @@ fn handle_key(app: &mut AppState, key: KeyEvent) {
                 app.focus = FocusPane::Notes;
                 app.message = "type to fuzzy-find notes".to_string();
             }
-            KeyCode::Char('?') => app.message = "Commands: / find | :new title | :rename title [--update-links] | :delete | :delete! | :links | :backlinks | :broken | :orphans | :tag a b | :type kind | :link target | :search text | :status | :stage | :unstage | :stage-all | :commit msg | :history | :diff | :snapshot msg".to_string(),
+            KeyCode::Char('?') => app.message = "Keys: Enter act | Tab/Shift-Tab pane | w layout | m zoom | n new | l link | h history | d diff | z snapshot | s stage | u unstage | / find | : command".to_string(),
             KeyCode::Char('j') | KeyCode::Down => app.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => app.move_selection(-1),
             KeyCode::Tab => app.next_focus(),
+            KeyCode::BackTab => app.previous_focus(),
+            KeyCode::Char('w') => app.cycle_layout(),
+            KeyCode::Char('m') => app.toggle_zoom(),
             KeyCode::Char('r') => {
                 app.refresh();
                 app.message = "refreshed".to_string();
             }
             KeyCode::Char('n') => app.mode = Mode::Command("new ".to_string()),
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('l') => app.mode = Mode::Command(app.command_for_selected_link()),
+            KeyCode::Char('h') => {
+                if let Err(err) = app.run_command("history 25") {
+                    app.message = err.to_string();
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Err(err) = app.run_command("diff") {
+                    app.message = err.to_string();
+                }
+            }
+            KeyCode::Char('z') => {
+                if let Err(err) = app.snapshot_now() {
+                    app.message = err.to_string();
+                }
+            }
+            KeyCode::Char('s') => {
                 if let Err(err) = app.run_command("stage") {
+                    app.message = err.to_string();
+                }
+            }
+            KeyCode::Char('u') => {
+                if let Err(err) = app.run_command("unstage") {
+                    app.message = err.to_string();
+                }
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Err(err) = app.run_command("stage-all") {
                     app.message = err.to_string();
                 }
             }
             _ => {}
         },
+    };
+    Ok(())
+}
+
+fn run_enter_action(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut AppState) {
+    let result = match app.focus {
+        FocusPane::Notes | FocusPane::Metadata => edit_with_terminal_restore(terminal, app),
+        FocusPane::Git => app.toggle_selected_git(),
+        FocusPane::Search if !app.search_hits.is_empty() => edit_search_hit(terminal, app),
+        FocusPane::Search => {
+            app.message = "history rows are read-only; use h/history or d/diff".to_string();
+            Ok(())
+        }
+    };
+    if let Err(err) = result {
+        app.message = err.to_string();
     }
+}
+
+fn edit_search_hit(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut AppState,
+) -> Result<()> {
+    suspend_terminal(terminal, |app| app.open_selected_search_hit(), app)
+}
+
+fn edit_with_terminal_restore(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut AppState,
+) -> Result<()> {
+    suspend_terminal(terminal, |app| app.edit_selected(), app)
+}
+
+fn suspend_terminal(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    action: impl FnOnce(&mut AppState) -> Result<()>,
+    app: &mut AppState,
+) -> Result<()> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    let result = action(app);
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    enable_raw_mode()?;
+    result
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &AppState) {
@@ -160,24 +241,93 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &AppState) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(3)])
         .split(root);
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
-        .split(vertical[0]);
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(body[2]);
-
-    draw_notes(frame, app, body[0]);
-    draw_metadata(frame, app, body[1]);
-    draw_git(frame, app, right[0]);
-    draw_search(frame, app, right[1]);
+    draw_body(frame, app, vertical[0]);
     draw_status(frame, app, vertical[1]);
+}
+
+fn draw_body(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
+    if let Some(pane) = app.zoomed {
+        draw_pane(frame, app, pane, area);
+        return;
+    }
+
+    match app.layout {
+        LayoutMode::Columns => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(28),
+                    Constraint::Percentage(28),
+                    Constraint::Percentage(22),
+                    Constraint::Percentage(22),
+                ])
+                .split(area);
+            draw_notes(frame, app, cols[0]);
+            draw_metadata(frame, app, cols[1]);
+            draw_git(frame, app, cols[2]);
+            draw_search(frame, app, cols[3]);
+        }
+        LayoutMode::Workbench => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
+                .split(area);
+            let right = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Percentage(44),
+                    Constraint::Percentage(28),
+                    Constraint::Percentage(28),
+                ])
+                .split(cols[1]);
+            draw_notes(frame, app, cols[0]);
+            draw_metadata(frame, app, right[0]);
+            draw_git(frame, app, right[1]);
+            draw_search(frame, app, right[2]);
+        }
+        LayoutMode::GitWide => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .split(area);
+            let top = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+                .split(rows[0]);
+            let bottom = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(rows[1]);
+            draw_notes(frame, app, top[0]);
+            draw_metadata(frame, app, top[1]);
+            draw_git(frame, app, bottom[0]);
+            draw_search(frame, app, bottom[1]);
+        }
+        LayoutMode::Stack => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Percentage(28),
+                    Constraint::Percentage(28),
+                    Constraint::Percentage(22),
+                    Constraint::Percentage(22),
+                ])
+                .split(area);
+            draw_notes(frame, app, rows[0]);
+            draw_metadata(frame, app, rows[1]);
+            draw_git(frame, app, rows[2]);
+            draw_search(frame, app, rows[3]);
+        }
+    }
+}
+
+fn draw_pane(frame: &mut ratatui::Frame<'_>, app: &AppState, pane: FocusPane, area: Rect) {
+    match pane {
+        FocusPane::Notes => draw_notes(frame, app, area),
+        FocusPane::Metadata => draw_metadata(frame, app, area),
+        FocusPane::Git => draw_git(frame, app, area),
+        FocusPane::Search => draw_search(frame, app, area),
+    }
 }
 
 fn draw_notes(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
@@ -213,7 +363,10 @@ fn draw_notes(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
         })
         .collect::<Vec<_>>();
     frame.render_widget(
-        List::new(items).block(block("Notes", app.focus == FocusPane::Notes)),
+        List::new(items).block(block(
+            "Notes  Enter edit  / find",
+            app.focus == FocusPane::Notes,
+        )),
         area,
     );
 }
@@ -260,6 +413,11 @@ fn draw_metadata(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
                         .unwrap_or_default(),
                 ),
             ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Actions: ", label()),
+                Span::raw("Enter edit | l link command | :rename | :move | :delete"),
+            ]),
         ]
     } else {
         vec![Line::from("No notes yet. Press n or run :new <title>.")]
@@ -267,7 +425,10 @@ fn draw_metadata(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(lines)
-            .block(block("Metadata", app.focus == FocusPane::Metadata))
+            .block(block(
+                "Metadata  Enter edit",
+                app.focus == FocusPane::Metadata,
+            ))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -293,7 +454,10 @@ fn draw_git(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
         items.push(ListItem::new("clean"));
     }
     frame.render_widget(
-        List::new(items).block(block("Git", app.focus == FocusPane::Git)),
+        List::new(items).block(block(
+            "Git  Enter toggle  s stage  u unstage  z snapshot",
+            app.focus == FocusPane::Git,
+        )),
         area,
     );
 }
@@ -315,10 +479,16 @@ fn draw_search(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
         .collect::<Vec<_>>();
 
     if lines.is_empty() {
-        lines.extend(app.history.iter().map(|line| ListItem::new(line.clone())));
+        lines.extend(app.history.iter().enumerate().map(|(idx, line)| {
+            let marker = if idx == app.selected_search { ">" } else { " " };
+            ListItem::new(format!("{marker} {line}"))
+        }));
     }
     frame.render_widget(
-        List::new(lines).block(block("Search / History", app.focus == FocusPane::Search)),
+        List::new(lines).block(block(
+            "Search / History  Enter hit  h log  d diff",
+            app.focus == FocusPane::Search,
+        )),
         area,
     );
 }
@@ -326,8 +496,10 @@ fn draw_search(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
 fn draw_status(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
     let text = match &app.mode {
         Mode::Normal => format!(
-            "{} | {} notes | {} changes",
+            "{} | pane {} | layout {} | {} notes | {} changes",
             app.message,
+            app.focus.label(),
+            app.layout.label(),
             app.index.notes.len(),
             app.git.files.len()
         ),
@@ -340,7 +512,9 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
         ),
     };
     frame.render_widget(
-        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Command")),
+        Paragraph::new(Text::from(text))
+            .block(Block::default().borders(Borders::ALL).title("Command"))
+            .wrap(Wrap { trim: true }),
         area,
     );
 }
