@@ -66,6 +66,16 @@ pub fn slugify(title: &str) -> String {
 }
 
 pub fn create_note(notebook: &Notebook, title: &str) -> Result<Note> {
+    create_note_with_metadata(notebook, title, None, Vec::new(), Vec::new())
+}
+
+pub fn create_note_with_metadata(
+    notebook: &Notebook,
+    title: &str,
+    kind: Option<String>,
+    tags: Vec<String>,
+    links: Vec<String>,
+) -> Result<Note> {
     let slug = slugify(title);
     let mut path = notebook.notes_root().join(format!("{slug}.md"));
     let mut suffix = 2;
@@ -74,7 +84,12 @@ pub fn create_note(notebook: &Notebook, title: &str) -> Result<Note> {
         suffix += 1;
     }
 
-    let meta = NoteMeta::new(title);
+    let mut meta = NoteMeta::new(title);
+    if let Some(kind) = kind {
+        meta.kind = kind;
+    }
+    meta.tags = tags;
+    meta.links = links;
     write_new_note(&path, &meta)?;
     Ok(Note {
         path,

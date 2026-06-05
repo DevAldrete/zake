@@ -1,10 +1,13 @@
 use anyhow::Result;
 use clap::Parser;
+use std::env;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use zake::app::AppState;
 use zake::cli::{Cli, Command};
 use zake::index::NoteIndex;
-use zake::note;
+use zake::note::{self as notes, Note};
 use zake::notebook::Notebook;
 use zake::search;
 
@@ -35,10 +38,93 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Some(Command::New { title, path }) => {
+        Some(Command::New {
+            title,
+            kind,
+            tags,
+            links,
+            path,
+        }) => {
             let notebook = Notebook::discover(path)?;
-            let created = note::create_note(&notebook, &title)?;
+            let created = notes::create_note_with_metadata(&notebook, &title, kind, tags, links)?;
             println!("{}", created.path.display());
+        }
+        Some(Command::List { path, tag, kind }) => {
+            let notebook = Notebook::discover(path)?;
+            let index = NoteIndex::build(&notebook);
+            for note in filtered_notes(&index, tag.as_deref(), kind.as_deref()) {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    note.path.display(),
+                    note.meta.title,
+                    note.meta.kind,
+                    note.meta.tags.join(",")
+                );
+            }
+        }
+        Some(Command::Show { note, path }) => {
+            let notebook = Notebook::discover(path)?;
+            let index = NoteIndex::build(&notebook);
+            let selected = resolve_note(&notebook, &index, &note)?;
+            print_note(&index, &selected);
+        }
+        Some(Command::Rename { note, title, path }) => {
+            let notebook = Notebook::discover(path)?;
+            let index = NoteIndex::build(&notebook);
+            let selected = resolve_note(&notebook, &index, &note)?;
+            let path = notes::rename_note(&selected, &title, &notebook)?;
+            println!("{}", path.display());
+        }
+        Some(Command::Move { note, folder, path }) => {
+            let notebook = Notebook::discover(path)?;
+            let index = NoteIndex::build(&notebook);
+            let selected = resolve_note(&notebook, &index, &note)?;
+            let path = notes::move_note(&selected, &notebook, &folder)?;
+            println!("{}", path.display());
+        }
+        Some(Command::Delete { note, path }) => {
+            let notebook = Notebook::discover(path)?;
+            let index = NoteIndex::build(&notebook);
+            let selected = resolve_note(&notebook, &index, &note)?;
+            notes::delete_note(&selected)?;
+            println!("Deleted {}", selected.path.display());
+        }
+        Some(Command::Set {
+            note,
+            kind,
+            tags,
+            links,
+            clear_tags,
+            clear_links,
+            path,
+        }) => {
+            if kind.is_none() && tags.is_empty() && links.is_empty() && !clear_tags && !clear_links
+            {
+                anyhow::bail!(
+                    "usage: zake set <note> [--type <type>] [--tag <tag>...] [--link <target>...] [--clear-tags] [--clear-links]"
+                );
+            }
+            let notebook = Notebook::discover(path)?;
+            let index = NoteIndex::build(&notebook);
+            let selected = resolve_note(&notebook, &index, &note)?;
+            notes::update_metadata(&selected.path, |meta| {
+                if let Some(kind) = kind {
+                    meta.kind = kind;
+                }
+                if clear_tags || !tags.is_empty() {
+                    meta.tags = tags;
+                }
+                if clear_links || !links.is_empty() {
+                    meta.links = links;
+                }
+            })?;
+            println!("Updated {}", selected.path.display());
+        }
+        Some(Command::Open { note, path }) => {
+            let notebook = Notebook::discover(path)?;
+            let index = NoteIndex::build(&notebook);
+            let selected = resolve_note(&notebook, &index, &note)?;
+            open_external_editor(&selected.path)?;
         }
         Some(Command::Search { query, path }) => {
             let notebook = Notebook::discover(path)?;
@@ -70,4 +156,100 @@ fn prompt_init_current_dir(reason: String) -> Result<Notebook> {
     } else {
         anyhow::bail!("no notebook selected")
     }
+}
+
+fn filtered_notes<'a>(
+    index: &'a NoteIndex,
+    tag: Option<&str>,
+    kind: Option<&str>,
+) -> impl Iterator<Item = &'a Note> {
+    index.notes.iter().filter(move |note| {
+        tag.is_none_or(|tag| {
+            note.meta
+                .tags
+                .iter()
+                .any(|item| item.eq_ignore_ascii_case(tag))
+        }) && kind.is_none_or(|kind| note.meta.kind.eq_ignore_ascii_case(kind))
+    })
+}
+
+fn resolve_note(notebook: &Notebook, index: &NoteIndex, query: &str) -> Result<Note> {
+    let query_path = Path::new(query);
+    for candidate in path_candidates(notebook, query_path, false) {
+        if candidate.exists() {
+            return notes::parse_note(candidate);
+        }
+    }
+
+    let query_lower = query.to_lowercase();
+    let matches = index
+        .notes
+        .iter()
+        .filter(|note| note.meta.title.to_lowercase() == query_lower)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [note] => Ok((*note).clone()),
+        [] => {
+            for candidate in path_candidates(notebook, query_path, true) {
+                if candidate.exists() {
+                    return notes::parse_note(candidate);
+                }
+            }
+            anyhow::bail!("no note found for `{query}`")
+        }
+        _ => anyhow::bail!("multiple notes found with title `{query}`; use a path"),
+    }
+}
+
+fn path_candidates(
+    notebook: &Notebook,
+    path: &Path,
+    include_extension_guess: bool,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    candidates.push(path.to_path_buf());
+    candidates.push(notebook.root.join(path));
+    candidates.push(notebook.notes_root().join(path));
+
+    if include_extension_guess && path.extension().is_none() {
+        candidates.push(path.with_extension("md"));
+        candidates.push(notebook.root.join(path).with_extension("md"));
+        candidates.push(notebook.notes_root().join(path).with_extension("md"));
+    }
+
+    candidates
+}
+
+fn print_note(index: &NoteIndex, note: &Note) {
+    println!("Title: {}", note.meta.title);
+    println!("Type: {}", note.meta.kind);
+    println!("Tags: {}", note.meta.tags.join(", "));
+    println!("Links: {}", note.meta.links.join(", "));
+    if !note.inline_links.is_empty() {
+        println!("Inline links: {}", note.inline_links.join(", "));
+    }
+    let backlinks = index
+        .backlinks
+        .get(&note.meta.title.to_lowercase())
+        .into_iter()
+        .flatten()
+        .filter_map(|idx| index.notes.get(*idx))
+        .map(|note| note.meta.title.as_str())
+        .collect::<Vec<_>>();
+    println!("Backlinks: {}", backlinks.join(", "));
+    if let Some(missing) = index.broken_links.get(&note.path) {
+        println!("Broken links: {}", missing.join(", "));
+    }
+    println!("Created: {}", note.meta.created_at);
+    println!("Updated: {}", note.meta.updated_at);
+    println!("Path: {}", note.path.display());
+}
+
+fn open_external_editor(path: &Path) -> Result<()> {
+    let editor = env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let status = ProcessCommand::new(editor).arg(path).status()?;
+    if !status.success() {
+        anyhow::bail!("editor exited unsuccessfully");
+    }
+    Ok(())
 }
